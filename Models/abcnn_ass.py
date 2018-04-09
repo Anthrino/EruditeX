@@ -11,6 +11,8 @@ import operator
 import time
 import datetime
 from tqdm import tqdm
+from random import shuffle
+import argparse
 
 sys.path.append('../')
 from os import path as path
@@ -42,8 +44,8 @@ class abcnn_model:
 		self.save_state = 10 # will save state every 10 questions
 		self.predict_label = None
 
-		self.q = tf.placeholder(tf.float32, [self.max_sent_len, self.vector_dim], 'question')
-		self.a = tf.placeholder(tf.float32, [self.max_sent_len, self.vector_dim], 'answer')
+		self.q = tf.placeholder(tf.float32, [self.max_sent_len, self.vector_dim], name='question')
+		self.a = tf.placeholder(tf.float32, [self.max_sent_len, self.vector_dim], name='answer')
 		self.label = tf.placeholder(tf.float32, name='label')
 		self.word_cnt = tf.placeholder(tf.float32, name='word_cnt')
 		self.tfidf = tf.placeholder(tf.float32, name='tfidf')
@@ -52,11 +54,20 @@ class abcnn_model:
 		# self.A_ = tf.placeholder(tf.float32, [self.vector_dim])
 
 		# [self.max_sent_len, self.vector_dim] [self.vector_dim, self.max_sent_len]
-		self.W_q = tf.Variable(tf.random_normal([self.max_sent_len, self.vector_dim]))
-		self.W_a = tf.Variable(tf.random_normal([self.max_sent_len, self.vector_dim]))
+		with tf.name_scope('Conv'):
+			self.W_q = tf.Variable(tf.random_normal([self.max_sent_len, self.vector_dim]), name='W_q')
+			self.W_a = tf.Variable(tf.random_normal([self.max_sent_len, self.vector_dim]), name='W_a')
+			
+			tf.summary.histogram('weights', self.W_q)
+			tf.summary.histogram('weights', self.W_a)
+		
 
-		self.W_lr = tf.Variable(tf.random_normal([3]))
-		self.B_lr = tf.Variable(tf.random_normal([1]))
+		with tf.name_scope('LogRegr'):
+			self.W_lr = tf.Variable(tf.random_normal([3]), name='W_lr')
+			self.B_lr = tf.Variable(tf.random_normal([1]), name='B_lr')
+
+			tf.summary.histogram('weights', self.W_lr)
+			tf.summary.histogram('biases', self.B_lr)
 
 
 	def pairwise_euclidean_dist(self, m0, m1):
@@ -272,7 +283,9 @@ class abcnn_model:
 		output_layer_test = tf.sigmoid(output_layer)
 
 		# cross entropy loss
-		loss = tf.nn.sigmoid_cross_entropy_with_logits(labels=self.label, logits=output_layer)
+		with tf.name_scope('Loss'):
+			loss = tf.nn.sigmoid_cross_entropy_with_logits(labels=self.label, logits=output_layer)
+		tf.summary.scalar('loss', tf.squeeze(loss))
 		# loss = -((self.label * tf.log(output_layer)) + ((1 - self.label) *
                                                  # tf.log(1 - output_layer)))
 
@@ -280,8 +293,9 @@ class abcnn_model:
 		# accuracy = tf.reduce_mean(tf.cast(correct, tf.float32))
 
 		train_step = optimizer.minimize(loss)
+		summ = tf.summary.merge_all()
 
-		return train_step, loss, output_layer_test
+		return train_step, loss, output_layer_test, summ
 
 
 	def qa_vectorize(self, q, a, glove):
@@ -318,20 +332,28 @@ class abcnn_model:
 
 	def model_state_saver(self, index, mode, u_dataset):
 		filename = path.join(path.dirname(path.dirname(path.realpath(__file__))), 'states/abcnn/state_')
-		timestamp = ''
+		timestamp = 'presentation'
 		
-		if mode == 'train': # Saving model state at training completion
-			timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
+		# if mode == 'train': # Saving model state at training completion
+		# 	timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
 
-		else: # Saving model state at checkpoint
-			timestamp = 'temp'
+		# else: # Saving model state at checkpoint
+		# 	timestamp = 'temp'
 		
+		try:
+			with open(filename + 'r.txt', 'r') as fp:
+				_, i, _u_dataset = tuple(fp.read().split(sep='\t'))
+				if u_dataset == _u_dataset:
+					index += int(i)
+		except:
+			pass
+
 		with open(filename + 'r.txt', 'w') as fp:
 			s = timestamp + '\t' + str(index) + '\t' + u_dataset
 			fp.write(s)
 
 		file_path = filename + timestamp + '.ckpt'
-		print('\n> Model state will be saved @', file_path)
+		tqdm.write('\n> Model state will be saved @ {}'.format(file_path))
 
 		return file_path # file_path is the path where the most recent training state will be saved.
 
@@ -481,23 +503,20 @@ class abcnn_model:
 		return final_data
 
 
-	def run_model_v2(self, mode='train', u_dataset='wikiqa', babi_id='1'):
+	def run_model_v2(self, mode, u_dataset, babi_id):
 		dataset = self.finalize_data(mode, u_dataset, babi_id)
 		# print(dataset[0])
 		mark_init = time.time()
 		
-		score = 0
-		p_score = 0
-		
-		instances = 0
-		p_instances = 0
-
-		iteration = 0
-		# result_file, accuracy_file = '', ''
-		
+		# Initialize Accuracy variables
+		score, p_score = 0, 0
+		p_instances, pred_pos = 0, 0
+		recall, precision = 0, 0
+		instances, iteration = 0, 0
+		per_itr_res = []
 		pred_labl = -1
 		
-		train_step, loss, output_layer_test = self.model()
+		train_step, loss, output_layer_test, summ = self.model()
 		saver = tf.train.Saver()
 
 		with tf.Session() as sess:
@@ -511,6 +530,7 @@ class abcnn_model:
 						dataset = dataset[index: ]
 						print('> Resuming training from instance {}'.format(index))
 				except:
+					print('> No saved state found. Initializing global variables.')
 					sess.run(tf.global_variables_initializer())
 
 			else:
@@ -521,11 +541,21 @@ class abcnn_model:
 					if _u_dataset == u_dataset:
 						dataset = dataset[index: ]
 						print('> Resuming testing from instance {}'.format(index))
-				except:
+				except Exception as e:
+					print(e)
 					print('> No saved state found. Exiting...')
 					sess.close()
 					import sys
 					sys.exit()
+
+			LOGDIR = path.join(path.dirname(path.dirname(path.realpath(__file__))), 'data/visualize/abcnn/{}/'.format(mode))
+			if u_dataset == 'babi':
+				writer = tf.summary.FileWriter(LOGDIR + 'babi_{}'.format(babi_id))
+			else:
+				writer = tf.summary.FileWriter(LOGDIR + 'wikiqa')
+			writer.add_graph(sess.graph)
+
+			shuffle(dataset)
 
 			for data in tqdm(dataset, total=len(dataset), ncols=75, unit=' QA Pairs'):
 				mark_start = time.time()
@@ -533,12 +563,15 @@ class abcnn_model:
 				input_dict = {self.q: q_vector, self.a: a_vector, self.label: label, self.word_cnt: word_cnt, self.tfidf: tfidf}
 
 				if mode == 'train':
-					_, l, self.predict_label = sess.run([train_step, loss, output_layer_test], feed_dict=input_dict)
+					_, l, self.predict_label, s = sess.run([train_step, loss, output_layer_test, summ], feed_dict=input_dict)
 				else:
-					l, self.predict_label = sess.run([loss, output_layer_test], feed_dict=input_dict)
+					l, self.predict_label, s = sess.run([loss, output_layer_test, summ], feed_dict=input_dict)
 
+				iteration += 1
+				
 				if self.predict_label[0] > 0.5:
 					pred_labl = 1
+					pred_pos += 1
 				else:
 					pred_labl = 0
 
@@ -546,36 +579,52 @@ class abcnn_model:
 					p_instances += 1
 				instances += 1
 
-				iteration += 1
-
 				if pred_labl == label:
 					score += 1
 					if label == 1:
 						p_score += 1
 
-				with open('result_abcnn.txt', 'a') as f:
-					itr_res = str('> QA' + str(iteration) + ' | Output Layer: ' + str(self.predict_label) + ' | Predicted Label: ' + str(pred_labl) + ' | Label: ' + str(label)+ ' | Loss:' + str(l)  + '| Elapsed: {0:.2f}'.format(time.time() - mark_start) + '\n')
-					f.write(itr_res)
+				per_itr_res.append(str('> QA' + str(iteration) + ' | Output Layer: ' + str(self.predict_label) + ' | Predicted Label: ' + str(pred_labl) + ' | Label: ' + str(label)+ ' | Loss:' + str(l)  + '| Elapsed: {0:.2f}'.format(time.time() - mark_start) + '\n'))
+
+				if instances % 10 == 0:
+					writer.add_summary(s, instances)
 
 				if instances % 100 == 0:
-					accuracy = (score / instances) * 100 
-					if p_instances > 0:
-						p_accuracy = (p_score / p_instances) * 100 
 
+					with open('result_abcnn.txt', 'a') as f:
+						for itr in per_itr_res:
+							f.write(itr)
+					per_itr_res = []
+					
 					with open('accuracy_abcnn.txt', 'a') as f:
+						
 						itr_res = 'Iteration: {}\n'.format(iteration)
-						itr_res += ' > Accuracy: {0:.2f}\n'.format(accuracy)
-						if p_instances > 0:
-							itr_res += '  > True_P accuracy: {0:.2f}\n'.format(p_accuracy)
-						f.write(itr_res)
 
-					score, instances = 0, 0
-					p_score, p_instances = 0, 0
+						accuracy = (score / instances) * 100
+						itr_res += ' > Accuracy: {0:.2f}\n'.format(accuracy)
+
+						if p_instances > 0:
+							recall = (p_score / p_instances) * 100 
+							itr_res += '  > True_+ve accuracy (recall): {0:.2f}\n'.format(recall)
+
+						if pred_pos > 0:
+							precision = (p_score / pred_pos) * 100 
+							itr_res += '  > Pred_+ve accuracy (precision): {0:.2f}\n'.format(precision)
+
+						if recall > 0 and precision > 0:
+							f1 = 2 * precision * recall / (precision + recall) 
+							itr_res += '  > F1 Score: {0:.2f}\n'.format(f1)
+
+						f.write(itr_res)
+						tqdm.write(itr_res)
 
 					if mode == 'train':
-						file_path = self.model_state_saver(iteration, 'temp', u_dataset)
+						file_path = self.model_state_saver(instances, 'temp', u_dataset)
 						saver.save(sess, file_path)
-						print(' > Model state saved @ ' + file_path)
+						tqdm.write(' > Model state saved @ ' + file_path)
+
+					score, instances, recall, precision = 0, 0, 0, 0
+					p_score, p_instances, pred_pos = 0, 0, 0
 
 			if mode == 'train':
 				file_path = self.model_state_saver(0, mode, u_dataset)
@@ -583,23 +632,25 @@ class abcnn_model:
 				print(' > Model state saved @ ' + file_path)
 
 
-	def ans_select(question, ans_list):
+	def ans_select(self, question, ans_list):
 
-		scores = {}
+		ans_sents = []
 
-		tfidf, word_cnt = self.extract_features(q, ans_list)
-		_, _, output_layer_test = self.model()
+		tfidf, word_cnt = self.extract_features(question, ans_list)
+		
+		_, _, output_layer_test, _ = self.model()
+		saver = tf.train.Saver()
 
 		with tf.Session() as sessn:
 			
 			filename, _, _ = self.model_state_loader()
 			try:
-				saver.restore(sess, filename)
+				print(filename)
+				saver.restore(sessn, filename)
 				print(' > Model state restored from @ ' + filename)
 			except:
 				print(' > No saved state found. Exiting')
 				sessn.close()
-				import sys
 				sys.exit()
 
 			glove = utils.load_glove(200)
@@ -611,13 +662,81 @@ class abcnn_model:
 				input_dict = {self.q: q_vector, self.a: a_vector, self.label: None, self.word_cnt: word_cnt[i], self.tfidf: tfidf[i]}
 				pred = sessn.run(output_layer_test, feed_dict=input_dict)
 
-				scores[ans] = pred
+				ans_sents.append((ans, pred))
 
-		ans_sents = sorted(scores.items(), key=operator.itemgetter(1))
+		ans_sents = sorted(ans_sents, key=operator.itemgetter(1), reverse=True) # Sorts by scores in desc order
+		
 		return ans_sents
+
+
+	def test_ans_select(self):
+		babi = utils.get_babi_raw_for_abcnn(babi_id='1', mode='test')
+		babi = utils.process_babi_for_abcnn(babi)
+
+		shuffle(babi)
+		babi = babi[:100]
+
+		instances, correct_op = len(babi), 0
+
+		_, _, output_layer_test, _ = self.model()
+		saver = tf.train.Saver()
+
+		with tf.Session() as sess:
+
+			filename, _, _ = self.model_state_loader()
+			try:
+				print(filename)
+				saver.restore(sess, filename)
+				print(' > Model state restored from @ ' + filename)
+			except Exception as e:
+				print(e)
+				print(' > No saved state found. Exiting')
+				sess.close()
+				sys.exit()
+
+			glove = utils.load_glove(200)
+
+			for sample in tqdm(babi, total=len(babi), ncols=75, unit='Sample '):
+				line_numbers, context, question, _, support = sample
+				ans_sents = []
+
+				tfidf, word_cnt = self.extract_features(question, context)
+
+				for i, ans in enumerate(context):
+					q_vector, a_vector = self.qa_vectorize(question, ans, glove)
+
+					input_dict = {self.q: q_vector, self.a: a_vector, self.label: None, self.word_cnt: word_cnt[i], self.tfidf: tfidf[i]}
+					pred = sess.run(output_layer_test, feed_dict=input_dict)
+
+					ans_sents.append((ans, pred))
+
+				ans_sent, _ = max(ans_sents, key=operator.itemgetter(1))
+				pred_labl = line_numbers[context.index(ans_sent)]
+				ans_sents = sorted(ans_sents, key=operator.itemgetter(1), reverse=True)
+				all_labels = [operator.itemgetter(0)(item) for item in ans_sents]
+				all_labels = [line_numbers[context.index(item)] for item in all_labels]
+				with open('context_accuracy_abcnn.txt', 'a') as f:
+					res = 'Correct Label: {}\tPredicted Label: {}\tSorted Labels: {}\n'.format(support, pred_labl, all_labels)
+					f.write(res)
+
+				if pred_labl == support:
+					correct_op += 1
+
+			accuracy = correct_op / instances
+			print('Accuracy: {0:.2f}'.format(accuracy))
 
 
 # model verification
 if __name__ == '__main__':
+	parser = argparse.ArgumentParser()
+	parser.add_argument('--mode', type=str, metavar='mode', default='train', help='What mode to run the model in: train(default), test')
+	parser.add_argument('--dataset', type=str, metavar='u_dataset', default='babi', help='Select the dataset to use: babi(default), wikiqa')
+	parser.add_argument('--babi_id', type=str, metavar='babi_id', default='1', help='Select which babi set to use: 1(default) - 20')
+	parser.set_defaults(shuffle=True)
+
+	args = parser.parse_args()
+	mode, u_dataset, babi_id = args.mode, args.dataset, args.babi_id
+
 	selector = abcnn_model()
-	selector.run_model_v2(u_dataset='babi')
+	selector.run_model_v2(mode=mode, u_dataset=u_dataset, babi_id=babi_id)
+	# selector.test_ans_select()

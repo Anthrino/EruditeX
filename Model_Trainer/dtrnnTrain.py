@@ -18,7 +18,8 @@ from sklearn.utils import shuffle
 
 class DT_RNN_Train(object):
 
-	def __init__(self, n=None, epochs=None, hid_dim=None):
+	def __init__(self, n=None, epochs=None, hid_dim=None,
+                 initialization='glorot_normal', optimization='adadelta'):
 		self.SentEmbd_type="DT_RNN_"
 
 		if not n:
@@ -34,9 +35,11 @@ class DT_RNN_Train(object):
 		else:
 			self.hid_dim = hid_dim
 
-		
+		optimizer = nn_utils.get_optimization_function(optimization)
+
 		from Models import dt_rnn
-		self.sent_embd = dt_rnn.DT_RNN(dim=self.hid_dim)
+		self.sent_embd = dt_rnn.DT_RNN(dim=self.hid_dim, word_vector_size = 200, 
+                                       initialization=initialization)
 		self.params = self.sent_embd.params
 
 		inputs1 = self.sent_embd.get_graph_input()
@@ -49,15 +52,13 @@ class DT_RNN_Train(object):
 		sentence_embedding1, self.hid1=self.sent_embd.get_theano_graph(inputs1)
 		sentence_embedding2, self.hid2=self.sent_embd.get_theano_graph(inputs2)
 
-		
-
 		self.similarity_score = T.dscalar('score')
 
 
 		self.score = (((nn_utils.cosine_similarity(self.hid1,self.hid2) + 1)/2) * 4) + 1
 		self.loss = T.sqrt(abs(T.square(self.score)-T.square(self.similarity_score)))
 		self.grad = theano.grad(self.loss, self.params)
-		self.updates = lasagne.updates.adadelta(self.loss, self.params) #BlackBox
+		self.updates = optimizer(self.loss, self.params) #BlackBox
 		
 		inputs=[]
 		inputs.extend(inputs1)
@@ -85,20 +86,31 @@ class DT_RNN_Train(object):
 			sent_tree_set1, sent_tree_set2, relatedness_scores, sick_text = shuffle(self.sent_tree_set1, self.sent_tree_set2, self.relatedness_scores, self.sick_text)
 			self.training(sent_tree_set1[:self.n], sent_tree_set2[:self.n], relatedness_scores[:self.n], epoch_val)
 
-			z=str(datetime.datetime.now()).split(' ')
-			file_name = self.SentEmbd_type+str(epoch_val+1)+"_"+str(self.n)+"_"+str(self.hid_dim)+"_"+z[0]+"_"+z[1].split('.')[0]+".txt"
+			z=str(datetime.datetime.now())
+			file_name = utils.get_file_name("txt", sentEmbdType=self.SentEmbd_type, epochNum = epoch_val+1, ntp = self.n, hiddenDims = self.hid_dim, timestamp = z)
 			logs_path = path_utils.get_logs_path('SentEmbd/'+file_name)
 
 
 			print("Testing")
 
-			acc = self.testing(self.sent_tree_set1[self.n:],self.sent_tree_set2[self.n:],self.relatedness_scores[self.n:],logs_path)
+			acc = self.testing(sent_tree_set1[self.n:],sent_tree_set2[self.n:],relatedness_scores[self.n:],logs_path)
 			acc = "{0:.3}".format(acc)
 			acc += "%"
 
 			print("Accuracy after epoch %d is %s"%(epoch_val+1,acc))
 			
-			file_name = self.SentEmbd_type+str(epoch_val+1)+"_"+str(self.n)+"_"+str(self.hid_dim)+"_"+acc+"_"+z[0]+"_"+z[1].split('.')[0]+".pkl"
+			file_name = file_name = utils.get_file_name(
+                "pkl",
+                sentEmbdType=self.SentEmbd_type,
+                epochNum=epoch_val+1,
+                ntp=self.n,
+                dep_len=56,
+                word_vector_size=200,
+                dim=self.hid_dim,
+                accuracy=acc,
+                timestamp=z,
+            )
+			# self.SentEmbd_type+str(epoch_val+1)+"_"+str(self.n)+"_"+str(self.hid_dim)+"_"+acc+"_"+z[0]+"_"+z[1].split('.')[0]+".pkl"
 			save_path = path_utils.get_save_states_path('SentEmbd/'+file_name)       
 				
 			self.sent_embd.save_params(save_path,self.epochs)
@@ -123,7 +135,8 @@ class DT_RNN_Train(object):
 				avg_acc += (abs(score[0]-relatedness_scores[num])/relatedness_scores[num])
 			avg_acc =(avg_acc/len(sent_tree_set1) * 100)
 			f.write("Average Accuracy: "+str(avg_acc)+"\n")
-			return avg_acc
+			f.write("No. of test pairs: "+str(num+1))
+		return avg_acc
 
 	def load_dataset(self, sick_path):
 
@@ -163,7 +176,7 @@ class DT_RNN_Train(object):
 		return
 
 	def training(self,sent_tree_set1,sent_tree_set2,score,epoch_val):
-		print("Training")
+		print("Training: Epoch ",epoch_val+1)
 		start = time.time()
 		for num in range(self.n):
 			sent1 = sent_tree_set1[num]
